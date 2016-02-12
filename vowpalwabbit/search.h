@@ -223,6 +223,7 @@ class predictor
 public:
   predictor(search& sch, ptag my_tag);
   ~predictor();
+  void reset();
 
   // tell the predictor what to use as input. a single example input
   // means non-LDF mode; an array of inputs means LDF mode

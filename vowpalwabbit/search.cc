@@ -2494,6 +2494,15 @@ predictor::predictor(search& sch, ptag my_tag) : is_ldf(false), my_tag(my_tag), 
   allowed_actions_cost = v_init<float>();
 }
 
+void predictor::reset()
+{ if (! oracle_is_pointer) oracle_actions.erase();
+  if (! allowed_is_pointer) allowed_actions.erase();
+  if (! allowed_cost_is_pointer) allowed_actions_cost.erase();
+  free_ec();
+  condition_on_tags.erase();
+  condition_on_names.erase();
+}
+
 void predictor::free_ec()
 { if (ec_alloced)
   { if (is_ldf)
