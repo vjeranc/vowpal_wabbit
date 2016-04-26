@@ -34,6 +34,7 @@ namespace Search
 {
 search_task* all_tasks[] =
 { &SequenceTask::task,
+  &SequenceMSDTask::task,
   &SequenceSpanTask::task,
   &SequenceTaskCostToGo::task,
   &ArgmaxTask::task,
