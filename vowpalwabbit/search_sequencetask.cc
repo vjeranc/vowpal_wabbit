@@ -103,9 +103,9 @@ void initialize(Search::search& sch, size_t& /*num_actions*/, po::variables_map&
   check_option<string>(data->constraints, all, vm, "constraints", false,
                        string_equal,
                        "warning: specified --constraints different than the one loaded from regressor. using loaded value of: ", "");
-  sch.set_options( Search::AUTO_CONDITION_FEATURES  |    // automatically add history features to our examples, please
-                   Search::AUTO_HAMMING_LOSS        |    // please just use hamming loss on individual predictions -- we won't declare loss
-                   Search::EXAMPLES_DONT_CHANGE     |    // we don't do any internal example munging
+  sch.set_options( Search::AUTO_CONDITION_FEATURES  |
+                   // Search::AUTO_HAMMING_LOSS        |
+                   Search::EXAMPLES_DONT_CHANGE     |
                    0);
   sch.set_label_parser( COST_SENSITIVE::cs_label, [](polylabel&l) -> bool { return l.cs.costs.size() == 0; });
   if (!vm.count("constraints")) {
@@ -137,18 +137,12 @@ inline v_array<action> & get_allowed(task_data *data,size_t pass, size_t i) {
   return data->allowed_per_pos[pos][pass];
 }
 
-inline void reset_tags(task_data * data) {
-  for(auto & v : data->tags) {
-    v.erase();
-  }
-  data->tags.erase();
-}
-
 inline void resize_tags(task_data * data, size_t size) {
   data->tags.resize(size);
 }
 
-inline void push_tag(task_data * data, size_t i, ptag p, action prediction) {
+inline void push_tag(task_data * data, size_t i, ptag p, action prediction, size_t pass) {
+  if (pass == 0) data->tags[i].erase();
   data->tags[i].push_back(tag{prediction, p});
 }
 
@@ -168,39 +162,55 @@ inline bool has_positional_decision(task_data * data, size_t i, size_t pass) {
   return pass < numOfPositions;
 }
 
+inline float pos_cost(task_data * data, ptag p) {
+  if (p <= 0) return 0;
+  return data->allowed_per_pos[p].size();
+}
+
 void run(Search::search& sch, vector<example*>& ec)
 { Search::predictor P(sch, (ptag)0);
   task_data * data = sch.get_task_data<task_data>();
-  reset_tags(data);
   resize_tags(data, ec.size());
   size_t pass = 0, shift = 1;
-    for (size_t i=0; i<ec.size(); i++)
-    {
-      while (has_positional_decision(data, i, pass)) {
-        ptag p = (ptag)shift;
-        action oracle     = get_label(ec[i], pass);
-        v_array<action> & allowed = get_allowed(data, pass, i);
-        size_t prediction = P.set_tag(p)
-                             .set_input(*ec[i])
-                             .set_oracle(oracle)
-                             .set_condition_range((ptag)i + shift, sch.get_history_length(), 'p')
-                             // previous POS
-                             .add_condition(get_previous_ptag(data, i), 'a')
-                             .set_allowed(allowed)
-                             .predict();
-
-        push_tag(data, i, p, prediction);
-        if (sch.output().good()){
-          char sep = has_positional_decision(data, i, pass+1) ? ' ' : '\n';
-          sch.output() << sch.pretty_label((uint32_t)prediction)
-                       << sep;
-        }
-        // checks if it has a positional decisions for the next pass
-        shift += 1;
-        pass += 1;
+  for (size_t i=0; i<ec.size(); i++)
+  {
+    float loss = 0;
+    bool noloss = false;
+    while (has_positional_decision(data, i, pass)) {
+      ptag p = (ptag)shift;
+      action oracle     = get_label(ec[i], pass);
+      v_array<action> & allowed = get_allowed(data, pass, i);
+      P.set_tag(p)
+       .set_input(*ec[i])
+       .set_oracle(oracle)
+       .set_condition_range((ptag)(shift-1), sch.get_history_length(), 'p')
+       .set_allowed(allowed);
+      if (pass > 0 || i > 0) {
+        P.add_condition(get_previous_ptag(data, i), 'a');
       }
-      pass = 0;
+
+      size_t prediction = P.predict();
+      push_tag(data, i, p, prediction, pass);
+      if (pass==0) {loss = prediction != oracle ?
+                          pos_cost(data, prediction) : 0;
+                    noloss = prediction != oracle ;}
+      else if (!noloss)       {
+        loss += (prediction != oracle);
+      }
+      // checks if it has a positional decisions for the next pass
+      shift += 1;
+      pass += 1;
     }
+    pass = 0;
+    sch.loss(loss);
+    if (sch.output().good()){
+      for(auto && a : data->tags[i]){
+      sch.output() << sch.pretty_label((uint32_t)a.a)
+                   << ' ';
+      }
+      sch.output() << '\n';
+    }
+  }
 }
 }
 
