@@ -46,7 +46,7 @@ struct task_data
 { string constraints;
   vector<vector<v_array<action>>> allowed_per_pos;
   v_array<action> allowed_on_zero;
-  v_array<v_array<tag>> tags;
+  vector<vector<tag>> tags;
 };
 
 inline void parse_constraints(string &constraints, task_data * data) {
@@ -116,10 +116,6 @@ void initialize(Search::search& sch, size_t& /*num_actions*/, po::variables_map&
 
 void finish(Search::search& sch)
 { task_data *data = sch.get_task_data<task_data>();
-  for(v_array<tag> & v : data->tags) {
-    v.delete_v();
-  }
-  data->tags.delete_v();
   delete data;
 }
 
@@ -142,14 +138,24 @@ inline void resize_tags(task_data * data, size_t size) {
 }
 
 inline void push_tag(task_data * data, size_t i, ptag p, action prediction, size_t pass) {
-  if (pass == 0) data->tags[i].erase();
+  if (pass == 0) data->tags[i].clear();
   data->tags[i].push_back(tag{prediction, p});
 }
 
 inline ptag get_previous_ptag(task_data * data, size_t i) {
-  if (i == 0) return -1;
+  if (i == 0) return 0;
   return data->tags[i-1][0].i;
 }
+
+inline ptag get_pos_ptag(task_data * data, size_t i) {
+  if (i == 0) return 0;
+  return data->tags[i][0].i;
+}
+
+inline vector<tag> & get_tags(task_data * data, size_t i) {
+  return data->tags[i];
+}
+
 
 inline bool has_positional_decision(task_data * data, size_t i, size_t pass) {
   if (pass == 0) return true;
@@ -162,9 +168,10 @@ inline bool has_positional_decision(task_data * data, size_t i, size_t pass) {
   return pass < numOfPositions;
 }
 
-inline float pos_cost(task_data * data, ptag p) {
+inline float pos_cost(task_data * data, action p) {
   if (p <= 0) return 0;
-  return data->allowed_per_pos[p].size();
+  size_t count = data->allowed_per_pos[p].size();
+  return count == 0 ? 1 : count;
 }
 
 void run(Search::search& sch, vector<example*>& ec)
@@ -174,7 +181,7 @@ void run(Search::search& sch, vector<example*>& ec)
   size_t pass = 0, shift = 1;
   for (size_t i=0; i<ec.size(); i++)
   {
-    float loss = 0;
+    int loss = 0;
     bool noloss = false;
     while (has_positional_decision(data, i, pass)) {
       ptag p = (ptag)shift;
@@ -183,16 +190,23 @@ void run(Search::search& sch, vector<example*>& ec)
       P.set_tag(p)
        .set_input(*ec[i])
        .set_oracle(oracle)
-       .set_condition_range((ptag)(shift-1), sch.get_history_length(), 'p')
        .set_allowed(allowed);
-      if (pass > 0 || i > 0) {
-        P.add_condition(get_previous_ptag(data, i), 'a');
+
+      if (i > 0) {
+        size_t start = i < sch.get_history_length() ? 0 : i - sch.get_history_length();
+        char name = 'a'; // for erasing previous conditions
+        for(size_t j = start; j < i; ++j) {
+          for(tag & t : get_tags(data, j)) {
+            if (name == 'a') P.set_condition(t.i, name++);
+            else             P.add_condition(t.i, name++);
+          }
+        }
       }
 
       size_t prediction = P.predict();
       push_tag(data, i, p, prediction, pass);
       if (pass==0) {loss = prediction != oracle ?
-                          pos_cost(data, prediction) : 0;
+                          pos_cost(data, oracle) : 0;
                     noloss = prediction != oracle ;}
       else if (!noloss)       {
         loss += (prediction != oracle);
@@ -202,7 +216,7 @@ void run(Search::search& sch, vector<example*>& ec)
       pass += 1;
     }
     pass = 0;
-    sch.loss(loss);
+    sch.loss(loss>0);
     if (sch.output().good()){
       for(auto && a : data->tags[i]){
       sch.output() << sch.pretty_label((uint32_t)a.a)
