@@ -35,6 +35,7 @@ namespace Search
 search_task* all_tasks[] =
 { &SequenceTask::task,
   &SequenceMSDTask::task,
+  &SequenceMSDTaskLayered::task,
   &SequenceSpanTask::task,
   &SequenceTaskCostToGo::task,
   &ArgmaxTask::task,
@@ -96,7 +97,7 @@ struct action_repr
   features *repr;
   action_repr(action _a, features* _repr) : a(_a)
   { if(_repr!=NULL)
-    { repr = new features(); 
+    { repr = new features();
       repr->deep_copy_from(*_repr);
     }
     else

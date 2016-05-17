@@ -9,6 +9,7 @@ license as described in the file LICENSE.
 
 namespace SequenceTask         { Search::search_task task = { "sequence",          run, initialize, nullptr,   nullptr,  nullptr     }; }
 namespace SequenceMSDTask         { Search::search_task task = { "sequence_msd",          run, initialize, finish,   nullptr,  nullptr     }; }
+namespace SequenceMSDTaskLayered  { Search::search_task task = { "sequence_msd_layered", run, initialize, finish,   nullptr,  nullptr     }; }
 namespace SequenceSpanTask     { Search::search_task task = { "sequencespan",      run, initialize, finish, setup, takedown }; }
 namespace SequenceTaskCostToGo { Search::search_task task = { "sequence_ctg",      run, initialize, nullptr,   nullptr,  nullptr     }; }
 namespace ArgmaxTask           { Search::search_task task = { "argmax",            run, initialize, finish,   nullptr,  nullptr     }; }
@@ -181,8 +182,6 @@ void run(Search::search& sch, vector<example*>& ec)
   size_t pass = 0, shift = 1;
   for (size_t i=0; i<ec.size(); i++)
   {
-    int loss = 0;
-    bool noloss = false;
     while (has_positional_decision(data, i, pass)) {
       ptag p = (ptag)shift;
       action oracle     = get_label(ec[i], pass);
@@ -194,35 +193,224 @@ void run(Search::search& sch, vector<example*>& ec)
 
       if (i > 0) {
         size_t start = i < sch.get_history_length() ? 0 : i - sch.get_history_length();
-        char name = 'a'; // for erasing previous conditions
+        char name = 'a', prevn='a'; // for erasing previous conditions
         for(size_t j = start; j < i; ++j) {
           for(tag & t : get_tags(data, j)) {
             if (name == 'a') P.set_condition(t.i, name++);
             else             P.add_condition(t.i, name++);
           }
+          name = prevn + 10;
+          prevn = name;
         }
       }
 
       size_t prediction = P.predict();
       push_tag(data, i, p, prediction, pass);
-      if (pass==0) {loss = prediction != oracle ?
-                          pos_cost(data, oracle) : 0;
-                    noloss = prediction != oracle ;}
-      else if (!noloss)       {
-        loss += (prediction != oracle);
+
+      sch.loss(prediction != oracle);
+      if (sch.output().good()){
+        sch.output() << sch.pretty_label((uint32_t)prediction);
+        if (has_positional_decision(data, i, pass+1)) {sch.output() << ' ';}
+        else                                          {sch.output() << '\n';}
       }
-      // checks if it has a positional decisions for the next pass
       shift += 1;
       pass += 1;
     }
     pass = 0;
-    sch.loss(loss>0);
-    if (sch.output().good()){
-      for(auto && a : data->tags[i]){
-      sch.output() << sch.pretty_label((uint32_t)a.a)
-                   << ' ';
+  }
+}
+}
+
+namespace SequenceMSDTaskLayered
+{
+using namespace Search;
+struct tag {
+  action a;
+  ptag i;
+};
+struct task_data
+{ string constraints;
+  vector<vector<v_array<action>>> allowed_per_pos;
+  v_array<action> allowed_on_zero;
+  vector<vector<tag>> tags;
+};
+
+inline void parse_constraints(string &constraints, task_data * data) {
+  istringstream ss(constraints);
+  struct msd {
+    uint32_t pos;
+    uint32_t action;
+    uint32_t position;
+  } m;
+  vector<msd> cs;
+  char colon;
+  while(ss >> m.pos >> colon >> m.action >> colon >> m.position >> colon) {
+    cs.emplace_back(m);
+  }
+  std::sort(cs.begin(), cs.end(), [](msd & a, msd &b){
+    return std::make_tuple(a.position) < std::make_tuple(b.position);
+  });
+  for(auto && c : cs) {
+    if (c.position != 0) break;
+    data->allowed_on_zero.push_back(c.action);
+  }
+  size_t poscount = data->allowed_on_zero.size();
+  data->allowed_per_pos.resize(poscount+1); // not using allowed_per_pos[0]
+  for(auto && c : cs) {
+    if (c.position == 0) continue;
+    vector<v_array<action>> & v = data->allowed_per_pos[c.pos];
+    if (v.size() <= c.position) { // TODO not using v[0]
+      v.resize(c.position+1);
+    }
+    v[c.position].push_back(c.action);
+  }
+}
+
+void initialize(Search::search& sch, size_t& /*num_actions*/, po::variables_map& vm)
+{ vw& all = sch.get_vw_pointer_unsafe();
+  task_data *data = new task_data();
+  sch.set_task_data<task_data>(data);
+  new_options(all, "MSD Tagger Options")
+  ("constraints", po::value<string>(&(data->constraints)), "For each POS tag and for each position contains a positional constraint.");
+  add_options(all);
+
+  check_option<string>(data->constraints, all, vm, "constraints", false,
+                       string_equal,
+                       "warning: specified --constraints different than the one loaded from regressor. using loaded value of: ", "");
+  sch.set_options( Search::AUTO_CONDITION_FEATURES  |
+                   // Search::AUTO_HAMMING_LOSS        |
+                   Search::EXAMPLES_DONT_CHANGE     |
+                   0);
+  sch.set_label_parser( COST_SENSITIVE::cs_label, [](polylabel&l) -> bool { return l.cs.costs.size() == 0; });
+  if (!vm.count("constraints")) {
+    THROW("--constraints need to be specified: ")
+  }
+  parse_constraints(data->constraints, data);
+}
+
+void finish(Search::search& sch)
+{ task_data *data = sch.get_task_data<task_data>();
+  delete data;
+}
+
+inline action get_label(example* ex, unsigned pass){
+  v_array<COST_SENSITIVE::wclass>& costs = ex->l.cs.costs;
+  return costs.size() > pass ? costs[pass].class_index : 0;
+}
+
+inline v_array<action> & get_allowed(task_data *data,size_t pass, size_t i) {
+  if (pass == 0) { // pos tags on first pass
+    return data->allowed_on_zero;
+  }
+  // positional tags on others depending on the previously predicted pos
+  action pos = data->tags[i][0].a;
+  return data->allowed_per_pos[pos][pass];
+}
+
+inline void resize_tags(task_data * data, size_t size) {
+  data->tags.resize(size);
+}
+
+inline void push_tag(task_data * data, size_t i, ptag p, action prediction, size_t pass) {
+  if (pass == 0) data->tags[i].clear();
+  data->tags[i].push_back(tag{prediction, p});
+}
+
+inline ptag get_previous_ptag(task_data * data, size_t i) {
+  if (i == 0) return 0;
+  return data->tags[i-1][0].i;
+}
+
+inline ptag get_pos_ptag(task_data * data, size_t i) {
+  if (i == 0) return 0;
+  return data->tags[i][0].i;
+}
+
+inline vector<tag> & get_tags(task_data * data, size_t i) {
+  return data->tags[i];
+}
+
+
+inline bool has_positional_decision(task_data * data, size_t i, size_t pass) {
+  if (pass == 0) return true;
+  action pos = data->tags[i][0].a;
+  size_t numOfPositions = data->allowed_per_pos[pos].size();
+  if (numOfPositions == 0) return false;
+  // if it's just MSD with one positional argument then size of the positions
+  // is 2 (constraint.position + 1), minus one is 1, so it works for pass=1 but
+  // for pass=2 it won't have any new positional decisions
+  return pass < numOfPositions;
+}
+
+inline float pos_cost(task_data * data, action p) {
+  if (p <= 0) return 0;
+  size_t count = data->allowed_per_pos[p].size();
+  return count == 0 ? 1 : count;
+}
+
+void run(Search::search& sch, vector<example*>& ec)
+{ Search::predictor P(sch, (ptag)0);
+  task_data * data = sch.get_task_data<task_data>();
+  resize_tags(data, ec.size());
+  size_t pass = 0, shift = 1;
+  bool touched = true;
+  while (touched){
+    touched = false;
+    for (size_t i=0; i<ec.size(); i++)
+    {
+      if (has_positional_decision(data, i, pass)) {
+        ptag p = (ptag)shift;
+        action oracle     = get_label(ec[i], pass);
+        v_array<action> & allowed = get_allowed(data, pass, i);
+        P.set_tag(p)
+         .set_input(*ec[i])
+         .set_oracle(oracle)
+         .set_allowed(allowed);
+
+
+        size_t start = i < sch.get_history_length() ? 0 : i - sch.get_history_length()/2;
+        size_t end = pass == 0 ? i :
+                         std::min(i+1 + sch.get_history_length()/2, ec.size());
+        char name = 'a', prevn = 'a'; // for erasing previous conditions
+        for(size_t j = start; j < end; ++j) {
+          if (j == i) continue;
+          for(tag & t : get_tags(data, j)) {
+            if (name == 'a') P.set_condition(t.i, name++);
+            else             P.add_condition(t.i, name++);
+          }
+          name = prevn + 10; // no msd has more than 10 labels
+          prevn = name;
+        }
+
+        size_t prediction = P.predict();
+        push_tag(data, i, p, prediction, pass);
+
+        shift += 1;
+        touched = true;
       }
-      sch.output() << '\n';
+    }
+    pass += 1;
+  }
+
+  int loss = 0;
+  for(int j = 0; j < ec.size(); ++j){
+    pass = 0;
+    for(tag & t : get_tags(data, j)) {
+      if (t.a !=  get_label(ec[j], pass++)) {
+        loss += 1;
+        break;
+      }
+    }
+  }
+  sch.loss(loss);
+  if (sch.output().good()){
+    for(int j = 0; j < ec.size(); ++j){
+      pass = 0;
+    for(tag & t : get_tags(data, j)) {
+      sch.output() << sch.pretty_label((uint32_t)t.a);
+      if (has_positional_decision(data, j, ++pass)) {sch.output() << ' ';}
+      else                                          {sch.output() << '\n';}
+    }
     }
   }
 }
